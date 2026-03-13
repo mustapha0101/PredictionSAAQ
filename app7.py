@@ -16,6 +16,8 @@ import plotly.graph_objects as go
 # Try importing Prophet. If unavailable, set Prophet to None.
 try:
     from prophet import Prophet
+    from prophet.diagnostics import cross_validation, performance_metrics
+    from prophet.plot import plot_cross_validation_metric
     prophet_available = True
 except Exception:
     Prophet = None
@@ -77,25 +79,73 @@ def forecast_models(series, horizon=36, start_today=False,rerun=False):
     idx = pd.date_range(start=start_fc, periods=horizon, freq='MS')
     hw_add_fc = hw_add.forecast(horizon)
     hw_mul_fc = hw_mul.forecast(horizon)
+    
+    # Correction des intervalles de confiance (croissance exponentielle façon "tube")
+    h_array = np.arange(1, horizon + 1)
+    expansion_factor = np.sqrt(h_array) * (1 + 0.05 * h_array)
+    
     hw_add_ci = pd.DataFrame({
         'pred': hw_add_fc.round(0),
-        'low': (hw_add_fc - 1.96 * se_add).round(0),
-        'high': (hw_add_fc + 1.96 * se_add).round(0)
+        'low': (hw_add_fc - 1.96 * se_add * expansion_factor).round(0),
+        'high': (hw_add_fc + 1.96 * se_add * expansion_factor).round(0)
     }, index=idx)
     hw_mul_ci = pd.DataFrame({
         'pred': hw_mul_fc.round(0),
-        'low': (hw_mul_fc - 1.96 * se_mul).round(0),
-        'high': (hw_mul_fc + 1.96 * se_mul).round(0)
+        'low': (hw_mul_fc - 1.96 * se_mul * expansion_factor).round(0),
+        'high': (hw_mul_fc + 1.96 * se_mul * expansion_factor).round(0)
     }, index=idx)
     results = {'HW_add': hw_add_ci, 'HW_mul': hw_mul_ci}
+    
     # Prophet model if available
     if prophet_available and Prophet is not None and len(series) >= 2:
         df_prophet = series.reset_index()
         df_prophet.columns = ['ds', 'y']
         try:
-            m = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
+            covid_dates = pd.DataFrame({
+              'holiday': 'covid_lockdown',
+              'ds': pd.to_datetime(['2020-03-01', '2020-04-01', '2020-05-01', '2020-12-01', '2021-01-01']),
+              'lower_window': 0,
+              'upper_window': 1,
+            })
+            m = Prophet(
+                yearly_seasonality=True, 
+                weekly_seasonality=False, 
+                daily_seasonality=False, 
+                interval_width=0.95,  # Augmentation de la largeur de l'intervalle pour un meilleur coverage
+                holidays=covid_dates,
+                changepoint_prior_scale=0.1  # Plus grande flexibilité de la tendance
+            )
+            
+            # --- Ajout d'un régresseur externe (Météo difficile) ---
+            # Si nous prédisons la série principale et qu'on a le df_prophet
+            m.add_regressor('mauvaise_meteo', prior_scale=0.5)
+            
+            # Préparer la donnée météo
+            # 13: Brouillard, 14: Pluie, 15: Averse, 17: Neige, 18: Poudrerie, 19: Verglas
+            mauvaise_meteo_codes = [13, 14, 15, 17, 18, 19]
+            # On va compter la proportion ou le nombre d'accidents par mois avec mauvaise météo dans "data"
+            # Note: cela nécessite que "data" soit accessible tel quel. 
+            if 'CD_COND_METEO' in data.columns:
+                df_meteo = data.copy()
+                df_meteo['is_bad_weather'] = df_meteo['CD_COND_METEO'].isin(mauvaise_meteo_codes).astype(int)
+                meteo_monthly = df_meteo.groupby('date')['is_bad_weather'].sum().reset_index()
+                meteo_monthly.columns = ['ds', 'mauvaise_meteo']
+                # Merge avec df_prophet
+                df_prophet = df_prophet.merge(meteo_monthly, on='ds', how='left').fillna(0)
+            else:
+                df_prophet['mauvaise_meteo'] = 0
+            
             m.fit(df_prophet)
             future = m.make_future_dataframe(periods=horizon, freq='MS')
+            
+            # Il faut fournir la variable exogène au futur (On projette la moyenne mensuelle historique)
+            if 'mauvaise_meteo' in df_prophet.columns:
+                df_prophet['month'] = df_prophet['ds'].dt.month
+                monthly_avg_meteo = df_prophet.groupby('month')['mauvaise_meteo'].mean().to_dict()
+                future['month'] = future['ds'].dt.month
+                future['mauvaise_meteo'] = future['month'].map(monthly_avg_meteo)
+                future = future.drop(columns=['month'])
+                
             forecast = m.predict(future)
             if start_today:
                 idx2 = pd.date_range(start=start_fc, periods=horizon, freq='MS')
@@ -113,6 +163,88 @@ def forecast_models(series, horizon=36, start_today=False,rerun=False):
             # si Prophet échoue, on ignore silencieusement (déjà géré par prophet_available)
             pass
     return results
+
+# --- Evaluation function (Train/Test Split) ---
+@st.cache_data
+def evaluate_models(series, test_size=12):
+    if len(series) <= 24: # Need enough data to train and test
+        return pd.DataFrame()
+    train = series.iloc[:-test_size]
+    test = series.iloc[-test_size:]
+    
+    results = []
+    
+    # 1. HW Additive
+    try:
+        hw_add = ExponentialSmoothing(train, trend='add', seasonal='add', seasonal_periods=12, initialization_method='estimated').fit()
+        pred_add = hw_add.forecast(test_size)
+        results.append({'Modèle': 'HW_add', 'RMSE': np.sqrt(((test - pred_add)**2).mean()), 'MAE': np.abs(test - pred_add).mean()})
+    except Exception:
+        pass
+        
+    # 2. HW Multiplicative
+    try:
+        hw_mul = ExponentialSmoothing(train, trend='add', seasonal='mul', seasonal_periods=12, initialization_method='estimated').fit()
+        pred_mul = hw_mul.forecast(test_size)
+        results.append({'Modèle': 'HW_mul', 'RMSE': np.sqrt(((test - pred_mul)**2).mean()), 'MAE': np.abs(test - pred_mul).mean()})
+    except Exception:
+        pass
+        
+    # 3. Prophet
+    if prophet_available and Prophet is not None:
+        try:
+            df_prophet = train.reset_index()
+            df_prophet.columns = ['ds', 'y']
+            
+            covid_dates = pd.DataFrame({
+              'holiday': 'covid_lockdown',
+              'ds': pd.to_datetime(['2020-03-01', '2020-04-01', '2020-05-01', '2020-12-01', '2021-01-01']),
+              'lower_window': 0,
+              'upper_window': 1,
+            })
+            
+            m = Prophet(
+                yearly_seasonality=True, 
+                weekly_seasonality=False, 
+                daily_seasonality=False, 
+                interval_width=0.95,
+                holidays=covid_dates,
+                changepoint_prior_scale=0.1
+            )
+            m.add_regressor('mauvaise_meteo', prior_scale=0.5)
+            
+            if 'CD_COND_METEO' in data.columns:
+                df_meteo = data.copy()
+                mauvaise_meteo_codes = [13, 14, 15, 17, 18, 19]
+                df_meteo['is_bad_weather'] = df_meteo['CD_COND_METEO'].isin(mauvaise_meteo_codes).astype(int)
+                meteo_monthly = df_meteo.groupby('date')['is_bad_weather'].sum().reset_index()
+                meteo_monthly.columns = ['ds', 'mauvaise_meteo']
+                df_prophet = df_prophet.merge(meteo_monthly, on='ds', how='left').fillna(0)
+            else:
+                df_prophet['mauvaise_meteo'] = 0
+                
+            m.fit(df_prophet)
+            
+            future = m.make_future_dataframe(periods=test_size, freq='MS')
+            if 'mauvaise_meteo' in df_prophet.columns:
+                df_prophet['month'] = df_prophet['ds'].dt.month
+                monthly_avg_meteo = df_prophet.groupby('month')['mauvaise_meteo'].mean().to_dict()
+                future['month'] = future['ds'].dt.month
+                future['mauvaise_meteo'] = future['month'].map(monthly_avg_meteo)
+                future = future.drop(columns=['month'])
+                
+            forecast = m.predict(future)
+            pred_prophet = forecast.set_index('ds').loc[test.index, 'yhat']
+            
+            results.append({'Modèle': 'Prophet', 'RMSE': np.sqrt(((test - pred_prophet)**2).mean()), 'MAE': np.abs(test - pred_prophet).mean()})
+        except Exception:
+            pass
+            
+    if results:
+        df_res = pd.DataFrame(results).set_index('Modèle').round(2)
+        df_res = df_res.sort_values('MAE')
+        return df_res
+    return pd.DataFrame()
 
 # --- Sidebar: paramètres ---
 st.sidebar.header("⚙️ Paramètres de prévision")
@@ -307,7 +439,7 @@ with tab1:
             st.info("Pas assez de données pour la décomposition des victimes (min 12 mois).")
 
     # --- Statistiques descriptives combinées ---
-    st.subheader("📋 Statistiques descriptives combinées")
+    st.subheader("📋 Statistiques descriptives combinées (/ mois pour toute la province)")
     stats_df = pd.DataFrame({
         'Nb valeurs': [accidents_series_filtered.count(), victims_series_filtered.count()],
         'Moyenne': [accidents_series_filtered.mean(), victims_series_filtered.mean()],
@@ -420,7 +552,9 @@ with tab2:
     if len(current_series) < 1:
         st.warning("La série sélectionnée est vide ou indisponible.")
     else:
-        model_choice = st.selectbox("Sélectionnez un modèle", list(forecast_models(current_series, horizon).keys()))
+        av_models = list(forecast_models(current_series, horizon).keys())
+        default_idx = av_models.index('Prophet') if 'Prophet' in av_models else 0
+        model_choice = st.selectbox("Sélectionnez un modèle", av_models, index=default_idx)
         hor = st.slider("Horizon (mois)", 36, 90, horizon, key='pred_hor')
         results_for = forecast_models(current_series, hor)
         if model_choice not in results_for:
@@ -433,8 +567,8 @@ with tab2:
                 fig_fc.add_trace(go.Scatter(x=current_series.index, y=current_series.values.round(0), mode='lines', name='Historique'))
             fig_fc.add_trace(go.Scatter(x=dfc.index, y=dfc['pred'], mode='lines+markers', name=f'Prévisions {model_choice}'))
             fig_fc.add_trace(go.Scatter(
-                x=list(dfc.index) + list(dfc.index[::-1]),
-                y=list(dfc['high']) + list(dfc['low'][::-1]),
+                x=list(dfc.index) + list(dfc.index)[::-1],
+                y=list(dfc['high']) + list(dfc['low'])[::-1],
                 fill='toself', fillcolor='rgba(255,165,0,0.2)',
                 line=dict(color='rgba(255,255,255,0)'), hoverinfo='skip', showlegend=True, name='Intervalle de confiance 95%'
             ))
@@ -480,6 +614,71 @@ with tab3:
 # --- Tab 4: Model comparison ---
 with tab4:
     st.header("⚖️ Comparaison des modèles")
+    
+    st.subheader("📊 Évaluation des modèles (Train/Test Split)")
+    st.markdown("Les modèles sont évalués en utilisant la dernière année complète (12 derniers mois) comme ensemble de test. Les métriques **RMSE** (Erreur Quadratique Moyenne) et **MAE** (Erreur Absolue Moyenne) permettent d'identifier le meilleur modèle.")
+    
+    option_eval = st.radio("Sélectionnez la série à évaluer", ['Accidents', 'Victimes'], horizontal=True)
+    eval_series = series if option_eval == 'Accidents' else victims_series
+    
+    eval_metrics = evaluate_models(eval_series, test_size=12)
+    if not eval_metrics.empty:
+        st.dataframe(eval_metrics.style.highlight_min(color='lightgreen', axis=0))
+        best_model = eval_metrics.index[0]
+        st.success(f"🏆 Le modèle recommandé pour les {option_eval.lower()} est **{best_model}** (selon le score MAE).")
+    else:
+        st.info("Pas assez de données pour l'évaluation Train/Test (besoin de > 24 mois).")
+        
+    # --- Native Prophet Cross Validation ---
+    if prophet_available and Prophet is not None:
+        st.subheader("🔁 Validation Croisée (Cross-Validation) Avancée avec Prophet")
+        st.markdown(
+            "Prophet permet une évaluation robuste en simulant plusieurs prévisions dans le passé (*backtesting*). "
+            "Il coupe l'historique plusieurs fois pour tester sa capacité de généralisation."
+        )
+        if st.button("Lancer la Cross-Validation Prophet (Peut prendre quelques secondes)"):
+            with st.spinner("Exécution de la validation croisée de Prophet..."):
+                try:
+                    df_cv_prophet = eval_series.reset_index()
+                    df_cv_prophet.columns = ['ds', 'y']
+                    
+                    covid_dates = pd.DataFrame({
+                      'holiday': 'covid_lockdown',
+                      'ds': pd.to_datetime(['2020-03-01', '2020-04-01', '2020-05-01', '2020-12-01', '2021-01-01']),
+                      'lower_window': 0,
+                      'upper_window': 1,
+                    })
+                    
+                    m_cv = Prophet(
+                        yearly_seasonality=True, 
+                        weekly_seasonality=False, 
+                        daily_seasonality=False, 
+                        interval_width=0.95,
+                        holidays=covid_dates,
+                        changepoint_prior_scale=0.1
+                    )
+                    
+                    m_cv.fit(df_cv_prophet)
+                    # ex: Initial 3 ans, horizon 1 an, on teste tous les 6 mois
+                    df_cv_result = cross_validation(m_cv, initial='1095 days', period='180 days', horizon='365 days')
+                    df_p = performance_metrics(df_cv_result)
+                    
+                    st.success("Validation croisée terminée avec succès!")
+                    st.dataframe(df_p[['horizon', 'rmse', 'mae', 'mape', 'coverage']].head(10))
+                    
+                    # Plot RMSE
+                    fig_cv = go.Figure()
+                    
+                    # Convert timedelta 'horizon' to integer days for proper plotly display
+                    horizon_days = df_p['horizon'].dt.days
+                    
+                    fig_cv.add_trace(go.Scatter(x=horizon_days, y=df_p['rmse'], mode='lines+markers', name='RMSE (Erreur)'))
+                    fig_cv.update_layout(title="Erreur RMSE en fonction de l'horizon de prédiction", xaxis_title="Horizon (en Jours)", yaxis_title="RMSE")
+                    st.plotly_chart(fig_cv, use_container_width=True)
+                except Exception as e:
+                    st.error(f"La validation croisée a échoué. Détails : {str(e)}")
+
+    st.subheader("📈 Projection de comparaison dans le futur")
     if len(series) > 0:
         hor2 = st.slider("Horizon (mois) pour comparaison", 36, 90, default_horizon, key='comp_hor')
         results_comp = forecast_models(series, hor2)
@@ -487,7 +686,7 @@ with tab4:
         fig4.add_trace(go.Scatter(x=series.index, y=series.values, mode='lines', name='Historique'))
         for name, result in results_comp.items():
             fig4.add_trace(go.Scatter(x=result.index, y=result['pred'], mode='lines', name=name))
-        fig4.update_layout(title="Comparaison des prévisions", xaxis_title='Date', yaxis_title='Valeur')
+        fig4.update_layout(title="Comparaison visuelle des prévisions futures", xaxis_title='Date', yaxis_title='Valeur')
         st.plotly_chart(fig4, use_container_width=True)
 
 # --- Tab 5: Predictions by region ---
@@ -527,8 +726,8 @@ with tab5:
                 dfc2 = res[key]
                 fig_reg.add_trace(go.Scatter(x=dfc2.index, y=dfc2['pred'], mode='lines+markers', name=m, line=dict(color=colors[m])))
                 fig_reg.add_trace(go.Scatter(
-                    x=list(dfc2.index) + list(dfc2.index[::-1]),
-                    y=list(dfc2['high']) + list(dfc2['low'][::-1]),
+                    x=list(dfc2.index) + list(dfc2.index)[::-1],
+                    y=list(dfc2['high']) + list(dfc2['low'])[::-1],
                     fill='toself', fillcolor=fills[m], line=dict(color='rgba(255,255,255,0)'), showlegend=False
                 ))
             fig_reg.update_layout(title=f"{type_ser} pour {reg}", xaxis_title='Date', yaxis_title='Nombre')
