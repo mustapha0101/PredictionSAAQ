@@ -790,7 +790,7 @@ with tab5:
 
         type_ser = st.selectbox("Sélectionner la série pour la région", ['Accidents', 'Victimes'])
         horizon_reg = st.slider("Horizon (mois)", min_value=36, max_value=90, value=36, key='horizon_reg')
-        models = st.multiselect("Modèles", ['Holt-Winters Additif', 'Holt-Winters Multiplicatif', 'Prophet'], default=['Holt-Winters Additif', 'Holt-Winters Multiplicatif', 'Prophet'])
+        models = st.multiselect("Modèles", ['Holt-Winters Additif', 'Holt-Winters Multiplicatif', 'Prophet'], default=['Prophet'])
         mapping = {'Holt-Winters Additif': 'HW_add', 'Holt-Winters Multiplicatif': 'HW_mul', 'Prophet': 'Prophet'}
         colors = {'Holt-Winters Additif': 'blue', 'Holt-Winters Multiplicatif': 'green', 'Prophet': 'red'}
         fills = {'Holt-Winters Additif': 'rgba(0,0,255,0.2)', 'Holt-Winters Multiplicatif': 'rgba(0,255,0,0.2)', 'Prophet': 'rgba(255,0,0,0.2)'}
