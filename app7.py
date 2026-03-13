@@ -1,4 +1,46 @@
 import streamlit as st
+
+# --- Page config ---
+st.set_page_config(page_title="Prévisions accidents et victimes", layout="wide")
+
+# --- Custom Loader Animation CEI2A ---
+loader_placeholder = st.empty()
+loader_placeholder.markdown("""
+<style>
+.loader-container {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background-color: #0E1117;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 999999;
+}
+.loader-text {
+    font-size: 6rem;
+    font-weight: 900;
+    background: linear-gradient(90deg, #1f77b4, #4CAF50, #1f77b4);
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: 15px;
+    font-family: 'Helvetica Neue', sans-serif;
+    animation: shine 2s linear infinite;
+}
+@keyframes shine {
+    to {
+        background-position: 200% center;
+    }
+}
+</style>
+<div class="loader-container" id="cei2a-loader">
+    <div class="loader-text">CEI2A</div>
+</div>
+""", unsafe_allow_html=True)
+
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -9,9 +51,6 @@ import statsmodels.api as sm  # pour compatibilité si besoin
 import matplotlib.pyplot as plt
 from datetime import datetime
 import os
-import plotly.express as px
-import plotly.graph_objects as go
-
 
 # Try importing Prophet. If unavailable, set Prophet to None.
 try:
@@ -23,8 +62,15 @@ except Exception:
     Prophet = None
     prophet_available = False
 
-# --- Page config ---
-st.set_page_config(page_title="Prévisions accidents et victimes", layout="wide")
+# --- Sidebar Header with Logo ---
+st.sidebar.markdown("""
+<div style="display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; margin-bottom: 2rem;">
+    <img src="https://upload.wikimedia.org/wikipedia/fr/thumb/9/99/SAAQ_logo.svg/3840px-SAAQ_logo.svg.png" alt="SAAQ Logo" style="width: 80%; margin-bottom: 1rem;">
+    <h2 style="color: #2E4057; margin-bottom: 0;">CEI2A</h2>
+    <p style="color: #6C757D; margin-top: 5px; font-weight: bold; font-size: 0.9rem;">Centre d'expertise en analytique et IA</p>
+    <hr style="width: 100%; border-top: 1px solid #ddd;">
+</div>
+""", unsafe_allow_html=True)
 st.title("📊 Analyse et prévisions des accidents et des victimes")
 
 # --- Load data ---
@@ -60,6 +106,9 @@ def load_data():
 
 # Load data
 data, series, victims_series = load_data()
+
+# Suppression du loader une fois l'import/chargement terminé
+loader_placeholder.empty()
 
 # --- Forecast function ---
 @st.cache_data
@@ -370,16 +419,11 @@ def plot_decomposition_with_changepoints_and_outliers(series, title_prefix="Sér
 with tab1:
     st.header("📈 Exploration Accidents & Victimes")
 
-    # --- Sélecteur de date ---
+    # --- Période (Filtre masqué) ---
     min_date = data['date'].min()
     max_date = data['date'].max()
-    start_date, end_date = st.date_input(
-        "Filtrer par période",
-        value=[min_date, max_date],
-        min_value=min_date,
-        max_value=max_date,
-        key="filter_date_combined"
-    )
+    start_date = min_date
+    end_date = max_date
 
     # Filtrage des données
     data_filtered = data[(data['date'] >= pd.to_datetime(start_date)) & (data['date'] <= pd.to_datetime(end_date))]
@@ -594,22 +638,63 @@ with tab2:
 # --- Tab 3: Variable analysis ---
 with tab3:
     st.header("🔍 Analyse par variables")
+    st.markdown("Explorez l'impact des conditions environnementales sur la fréquence et la **sévérité** des accidents.")
+    
     categorical_vars = {
         'CD_ETAT_SURFC': {'desc': 'État de la chaussée', 'mapping': {11: 'Sèche', 12: 'Mouillée', 13: 'Eau', 14: 'Neige', 15: 'Glace', 99: 'Autre'}},
         'CD_ECLRM': {'desc': 'Éclairement', 'mapping': {1: 'Jour', 2: 'Crépuscule', 3: 'Nuit éclairée', 4: 'Nuit non éclairée'}},
         'CD_ENVRN_ACCDN': {'desc': 'Environnement', 'mapping': {1: 'Scolaire', 2: 'Résidentiel', 3: 'Affaires', 4: 'Industriel', 5: 'Rural', 6: 'Forestier'}},
         'CD_COND_METEO': {'desc': 'Météo', 'mapping': {11: 'Clair', 12: 'Couvert', 13: 'Brouillard', 14: 'Pluie', 15: 'Averse', 16: 'Vent', 17: 'Neige', 18: 'Poudrerie', 19: 'Verglas', 99: 'Autre'}}
     }
-    for var, meta in categorical_vars.items():
-        if var in data.columns:
-            st.subheader(meta['desc'])
-            counts = data[var].map(meta['mapping']).value_counts().reset_index()
+    
+    selected_var_key = st.selectbox("Sélectionnez le facteur à analyser :", list(categorical_vars.keys()), format_func=lambda x: categorical_vars[x]['desc'])
+    meta = categorical_vars[selected_var_key]
+    var = selected_var_key
+
+    if var in data.columns:
+        st.markdown(f"### Détails pour : {meta['desc']}")
+        
+        # Application du mapping
+        data_mapped = data.copy()
+        data_mapped[var] = data_mapped[var].map(meta['mapping']).fillna('Inconnu')
+        
+        # Filtre optionnel pour enlever "Inconnu"
+        data_mapped = data_mapped[data_mapped[var] != 'Inconnu']
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Répartition (%)
+            counts = data_mapped[var].value_counts().reset_index()
             counts.columns = [meta['desc'], "Nombre d'accidents"]
-            fig3 = px.bar(counts, x=meta['desc'], y="Nombre d'accidents", text="Nombre d'accidents", color="Nombre d'accidents", color_continuous_scale="Blues")
-            fig3.update_traces(textposition='outside')
-            st.plotly_chart(fig3, use_container_width=True)
-            if not counts.empty:
-                st.markdown(f"📌 **Insight** : La majorité des accidents surviennent quand la condition est **{counts.iloc[0][0]}** ({counts.iloc[0][1]} cas).")
+            fig_pie = px.pie(counts, values="Nombre d'accidents", names=meta['desc'], title=f"Répartition par {meta['desc'].lower()}", hole=0.4, color_discrete_sequence=px.colors.sequential.Blues_r)
+            st.plotly_chart(fig_pie, use_container_width=True)
+            
+        with col2:
+            # Sévérité (Victimes par accident)
+            if 'NB_VICTIMES_TOTAL' in data_mapped.columns:
+                severity = data_mapped.groupby(var)['NB_VICTIMES_TOTAL'].mean().reset_index()
+                severity.columns = [meta['desc'], "Victimes moy. / accident"]
+                severity = severity.sort_values(by="Victimes moy. / accident", ascending=False)
+                fig_sev = px.bar(severity, x=meta['desc'], y="Victimes moy. / accident", title="Sévérité du risque (Victimes par accident)", color="Victimes moy. / accident", color_continuous_scale="Reds")
+                st.plotly_chart(fig_sev, use_container_width=True)
+            else:
+                st.info("Sévérité indisponible (colonne NB_VICTIMES_TOTAL manquante).")
+                severity = pd.DataFrame()
+        
+        # Evolution temporelle
+        st.markdown(f"#### Évolution mensuelle selon : {meta['desc'].lower()}")
+        time_dist = data_mapped.groupby(['date', var]).size().reset_index(name='Nombre d\'accidents')
+        fig_time = px.line(time_dist, x='date', y='Nombre d\'accidents', color=var, title=f"Tendances historiques croisées")
+        st.plotly_chart(fig_time, use_container_width=True)
+        
+        # Insights texte narratif
+        if not counts.empty:
+            st.info(f"📌 **Fréquence** : La condition **{counts.iloc[0][0]}** est historiquement la plus fréquente avec un total de **{counts.iloc[0][1]}** accidents enregistrés.")
+            if 'NB_VICTIMES_TOTAL' in data_mapped.columns and not severity.empty:
+                st.warning(f"⚠️ **Facteur de Risque Majeur** : Bien que moins fréquente, la situation **{severity.iloc[0][0]}** génère les accidents les plus graves (en moyenne **{severity.iloc[0][1]:.2f}** victimes à chaque incident).")
+    else:
+        st.error(f"La colonne {var} est introuvable dans le jeu de données SAAQ.")
 
 # --- Tab 4: Model comparison ---
 with tab4:
@@ -696,7 +781,13 @@ with tab5:
         st.warning("⚠️ Pas de colonne 'REG_ADM' dans les données.")
     else:
         regions = sorted(data['REG_ADM'].dropna().unique())
-        selected_regions = st.multiselect("Sélectionner une ou plusieurs régions", regions, default=regions[:3] if regions else [])
+        
+        st.info("💡 **Conseil :** Sélectionnez une région à la fois pour éviter de surcharger le serveur de prévision.")
+        selected_regions = st.multiselect("Sélectionner une ou plusieurs régions", regions, default=[])
+        
+        if len(selected_regions) > 2:
+            st.warning("⚠️ Attention : Entraîner les modèles (surtout Prophet) sur plusieurs régions simultanément peut saturer la mémoire (Erreur 502) en production.")
+
         type_ser = st.selectbox("Sélectionner la série pour la région", ['Accidents', 'Victimes'])
         horizon_reg = st.slider("Horizon (mois)", min_value=36, max_value=90, value=36, key='horizon_reg')
         models = st.multiselect("Modèles", ['Holt-Winters Additif', 'Holt-Winters Multiplicatif', 'Prophet'], default=['Holt-Winters Additif', 'Holt-Winters Multiplicatif', 'Prophet'])
